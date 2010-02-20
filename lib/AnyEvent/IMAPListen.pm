@@ -8,7 +8,37 @@ use AnyEvent;
 use Mail::IMAPClient;
 
 our $VERSION = '0.01';
-our $INTERVAL = 180;
+our $INTERVAL = 300;
+
+=head1 NAME
+
+AnyEvent::IMAPListen
+
+=head1 SYNOPSIS
+
+  use AnyEvent::IMAPListen;
+  # パラメータはMail::IMAPClientと同じで、
+  # on_notify, on_error, on_connect, handle_notify
+  # のメソッドを追加で定義できるようになっている
+  my $listener; $listener = AnyEvent::IMAPListen->new(
+      Server    => 'imap.gmail.com',
+      Port      => 993,
+      User      => 'aaaa',
+      Password  => 'xxxxxx',
+      Ssl       => 1,
+      Uid       => 1,
+      Debug     => 1,
+      on_notify => sub { # if mail comes
+          my ($self, $header, $msg_id) = @_;
+      },
+      on_error => sub {
+          my ($self, $e_error, $l_error) = @_;
+      }
+  )->start;
+
+  AE::cv->wait;
+
+=cut
 
 sub new {
     my $pkg = shift;
@@ -83,6 +113,7 @@ sub start() {
     $self->imap(Mail::IMAPClient->new(%$args))
         or die "Could not connect to IMAP server";
 
+    $self->imap->select("inbox");
     $self->event(on_connect => $self->imap);
     $self->handle_on_connected($noop_interval);
 
@@ -96,8 +127,6 @@ sub handle_on_connected {
     my $imap = $self->imap;
 
     my ($idle, %cached_msgs);
-
-    $imap->select("inbox");
 
     $idle = $imap->idle or warn "Couldn't idle: $@\n";
 
@@ -128,36 +157,9 @@ sub handle_on_connected {
 1;
 __END__
 
-=head1 NAME
-
-AnyEvent::IMAPListen -
-
-=head1 SYNOPSIS
-
-  use AnyEvent::IMAPListen;
-
-=head1 DESCRIPTION
-
-AnyEvent::IMAPListen is
-
 =head1 AUTHOR
 
 taiyoh E<lt>sun.basix@gmail.comE<gt>
-
-=head2 messages
-
----
-Date:
-  - 'Thu, 18 Feb 2010 19:36:26 +0900'
-From:
-  - '=?iso-2022-jp?B?GyRCRURDZhsoQiAbJEJCQE1bGyhC?= <sun.basix@gmail.com>'
-Message-Id:
-  - '<68190610-0E21-41CA-AD1D-6C1D45C3C211@gmail.com>'
-Subject:
-  - test
-To:
-  - 'Tanaka Taiyoh <mobile.basix@gmail.com>'
-
 
 =head1 SEE ALSO
 
