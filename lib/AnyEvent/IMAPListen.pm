@@ -7,7 +7,7 @@ use base qw/Object::Event/;
 use AnyEvent;
 use Mail::IMAPClient;
 
-our $VERSION = '0.021';
+our $VERSION = '0.025';
 our $INTERVAL = 300;
 
 =head1 NAME
@@ -105,7 +105,7 @@ sub reg_ae ($$;$@) {
     }
     else {
         my $f = "AE::${name}";
-        push @{ $self->{_ae}{$name} }, &$f(@args);
+        $self->{_ae}{$name} = &$f(@args);
     }
 }
 
