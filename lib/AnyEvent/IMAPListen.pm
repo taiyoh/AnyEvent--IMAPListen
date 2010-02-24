@@ -7,7 +7,7 @@ use base qw/Object::Event/;
 use AnyEvent;
 use Mail::IMAPClient;
 
-our $VERSION = '0.02';
+our $VERSION = '0.021';
 our $INTERVAL = 300;
 
 =head1 NAME
@@ -121,7 +121,7 @@ sub start() {
     }
 
     $self->_construct;
-    $self->handle_on_connected($INTERVAL);
+    $self->handle_on_connected($noop_interval);
 
     $self;
 }
