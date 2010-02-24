@@ -7,7 +7,7 @@ use base qw/Object::Event/;
 use AnyEvent;
 use Mail::IMAPClient;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 our $INTERVAL = 300;
 
 =head1 NAME
@@ -97,53 +97,80 @@ sub ae (;$) {
     $_[0]->{_ae};
 }
 
-sub reg_ae ($@) {
+sub reg_ae ($$;$@) {
     my $self = shift;
     my ($name, @args) = @_;
-    my $f = "AE::${name}";
-    push @{ $self->{_ae}{$name} }, &$f(@args);
+    if (ref($args[0]) =~ /^(AnyEvent|AE)/) {
+        $self->{_ae}{$name} = $args[0];
+    }
+    else {
+        my $f = "AE::${name}";
+        push @{ $self->{_ae}{$name} }, &$f(@args);
+    }
 }
 
 sub start() {
     my $self = shift;
 
-    my $args = delete $self->{args};
-    my $noop_interval = delete $args->{noop_interval} || $INTERVAL;
+    my $noop_interval;
+    if ($self->{args}->{noop_interval}) {
+        $noop_interval = delete $self->{args}->{noop_interval} || $INTERVAL;
+    }
+    else {
+        $noop_interval = $INTERVAL;
+    }
 
-    $self->imap(Mail::IMAPClient->new(%$args))
+    $self->_construct;
+    $self->handle_on_connected($INTERVAL);
+
+    $self;
+}
+
+sub _construct {
+    my $self = shift;
+    $self->imap(Mail::IMAPClient->new(%{ $self->{args} }))
         or die "Could not connect to IMAP server";
 
     $self->imap->select("inbox");
     $self->event(on_connect => $self->imap);
-    $self->handle_on_connected($noop_interval);
-
-    $self;
 }
 
 sub handle_on_connected {
     my $self     = shift;
     my $interval = shift || $INTERVAL;
 
-    my $imap = $self->imap;
-
     my ($idle, %cached_msgs);
 
+  REGISTER_IMAP_AE:
+    my $imap = $self->imap;
     $idle = $imap->idle or warn "Couldn't idle: $@\n";
 
     $self->reg_ae(io => $imap->Socket, 0 , sub {
-        $imap->done($idle);
-        warn "[DEBUG] notify!\n" if $imap->Debug;
-        eval {
-            for my $msgid (grep { !$cached_msgs{$_} } @{ $imap->unseen }) {
-                $cached_msgs{$msgid} = 1;
-                warn "[DEBUG] id: ${msgid}\n" if $imap->Debug;
-                $self->event(handle_notify => $msgid);
+        my $s = $imap->Socket;
+        my $line = <$s>;
+        if ($line =~ /EXISTS/) {
+            $imap->done($idle);
+            warn "[DEBUG] notify!\n" if $imap->Debug;
+            eval {
+                for my $msgid (grep { !$cached_msgs{$_} } @{ $imap->unseen }) {
+                    $cached_msgs{$msgid} = 1;
+                    warn "[DEBUG] id: ${msgid}\n" if $imap->Debug;
+                    $self->event(handle_notify => $msgid);
+                }
+            };
+            if ($@) {
+                $self->event(on_error => $@, $imap->LastError, $imap);
             }
-        };
-        if ($@) {
-            $self->event(on_error => $@, $imap->LastError, $imap);
+            $idle = $imap->idle;
         }
-        $idle = $imap->idle;
+        elsif ($line =~ /BYE/) {
+            delete $self->{_ae}{io};
+            $imap->logout;
+            $imap->disconnect;
+            $self->{imap} = undef;
+            $self->_construct;
+            goto REGISTER_IMAP_AE;
+        }
     });
 
     $self->reg_ae(timer => $interval, $interval, sub {
