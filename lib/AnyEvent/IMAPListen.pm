@@ -109,6 +109,16 @@ sub reg_ae ($$;$@) {
     }
 }
 
+sub unreg_ae ($;@) {
+    my $self = shift;
+    if (@_) {
+        delete $self->{_ae}{$_} for @_;
+    }
+    else {
+        $self->{_ae} = undef;
+    }
+}
+
 sub start() {
     my $self = shift;
 
@@ -120,7 +130,6 @@ sub start() {
         $noop_interval = $INTERVAL;
     }
 
-    $self->_construct;
     $self->handle_on_connected($noop_interval);
 
     $self;
@@ -142,11 +151,12 @@ sub handle_on_connected {
     my ($idle, %cached_msgs);
 
   REGISTER_IMAP_AE:
-    my $imap = $self->imap;
-    $idle = $imap->idle or warn "Couldn't idle: $@\n";
+    $self->_construct;
 
-    $self->reg_ae(io => $imap->Socket, 0 , sub {
-        my $s = $imap->Socket;
+    $idle = $self->imap->idle or warn "Couldn't idle: $@\n";
+    $self->reg_ae(io => $self->imap->Socket, 0 , sub {
+        my $imap = $self->imap;
+        my $s = $self->imap->Socket;
         my $line = <$s>;
         if ($line =~ /EXISTS/) {
             $imap->done($idle);
@@ -164,20 +174,26 @@ sub handle_on_connected {
             $idle = $imap->idle;
         }
         elsif ($line =~ /BYE/) {
-            delete $self->{_ae}{io};
+            warn "[DEBUG] bye\n" if $imap->Debug;
+            $self->unreg_ae;
             $imap->logout;
             $imap->disconnect;
             $self->{imap} = undef;
-            $self->_construct;
             goto REGISTER_IMAP_AE;
         }
     });
 
     $self->reg_ae(timer => $interval, $interval, sub {
+        my $imap = $self->imap;
+        unless ($imap->Socket->connected) {
+            $self->unreg_ae;
+            goto REGISTER_IMAP_AE;
+        }
         warn "[DEBUG] noop ".AE::now()."\n" if $imap->Debug;
         $imap->done($idle);
         %cached_msgs = map { $_ => 1 } @{ $imap->unseen };
         $idle = $imap->idle;
+        AE::now_update;
     });
 }
 
