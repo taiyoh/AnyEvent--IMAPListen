@@ -1,10 +1,11 @@
 package AnyEvent::IMAPListen;
 
 use common::sense;
-use utf8;
 use base qw/Object::Event/;
 
 use AnyEvent;
+use AnyEvent::Handle;
+use IO::Socket::SSL;
 use Mail::IMAPClient;
 
 our $VERSION = '0.025';
@@ -130,28 +131,39 @@ sub start() {
         $noop_interval = $INTERVAL;
     }
 
-    $self->handle_on_connected($noop_interval);
+    my $server = delete $self->{args}{Server};
+    my $port   = delete $self->{args}{Port};
+
+    my ($hdl, $socket);
+    my %aeh; %aeh = (
+        on_error => sub {
+            $socket = IO::Socket::SSL->new(
+                PeerAddr => $server,
+                PeerPort => $port,
+            ) or die "socket(): $@";
+            $hdl = AnyEvent::Handle->new( fh => $socket, %aeh );
+
+            $self->imap(Mail::IMAPClient->new(%{ $self->{args} }, Socket => $hdl->fh))
+                or die "Could not connect to IMAP server";
+            $self->imap->select("inbox");
+            $self->event(on_connect => $self->imap);
+
+            $self->handle_on_connected($noop_interval);
+            $self->reg_ae(handle => $hdl);
+        }
+    );
+
+    $aeh{on_error}->();
 
     $self;
 }
 
-sub _construct {
-    my $self = shift;
-    $self->imap(Mail::IMAPClient->new(%{ $self->{args} }))
-        or die "Could not connect to IMAP server";
-
-    $self->imap->select("inbox");
-    $self->event(on_connect => $self->imap);
-}
 
 sub handle_on_connected {
     my $self     = shift;
     my $interval = shift || $INTERVAL;
 
     my ($idle, %cached_msgs);
-
-  REGISTER_IMAP_AE:
-    $self->_construct;
 
     $idle = $self->imap->idle or warn "Couldn't idle: $@\n";
     $self->reg_ae(io => $self->imap->Socket, 0 , sub {
