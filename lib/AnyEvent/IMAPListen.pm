@@ -191,16 +191,11 @@ sub handle_on_connected {
             $imap->logout;
             $imap->disconnect;
             $self->{imap} = undef;
-            goto REGISTER_IMAP_AE;
         }
     });
 
     $self->reg_ae(timer => $interval, $interval, sub {
         my $imap = $self->imap;
-        unless ($imap->Socket->connected) {
-            $self->unreg_ae;
-            goto REGISTER_IMAP_AE;
-        }
         warn "[DEBUG] noop ".AE::now()."\n" if $imap->Debug;
         $imap->done($idle);
         %cached_msgs = map { $_ => 1 } @{ $imap->unseen };
