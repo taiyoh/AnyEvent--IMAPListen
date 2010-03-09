@@ -8,7 +8,7 @@ use AnyEvent::Handle;
 use IO::Socket::SSL;
 use Mail::IMAPClient;
 
-our $VERSION = '0.025';
+our $VERSION = '0.03';
 our $INTERVAL = 300;
 
 =head1 NAME
@@ -134,39 +134,41 @@ sub start() {
     my $server = delete $self->{args}{Server};
     my $port   = delete $self->{args}{Port};
 
-    my ($hdl, $socket);
-    my %aeh; %aeh = (
-        on_error => sub {
-            $socket = IO::Socket::SSL->new(
-                PeerAddr => $server,
-                PeerPort => $port,
-            ) or die "socket(): $@";
-            $hdl = AnyEvent::Handle->new( fh => $socket, %aeh );
-
-            $self->imap(Mail::IMAPClient->new(%{ $self->{args} }, Socket => $hdl->fh))
-                or die "Could not connect to IMAP server";
-            $self->imap->select("inbox");
-            $self->event(on_connect => $self->imap);
-
-            $self->handle_on_connected($noop_interval);
-            $self->reg_ae(handle => $hdl);
-        }
-    );
-
-    $aeh{on_error}->();
-
-    $self;
-}
-
-
-sub handle_on_connected {
-    my $self     = shift;
-    my $interval = shift || $INTERVAL;
-
+    my ($hdl, $socket, $connect, $read);
     my ($idle, %cached_msgs);
 
-    $idle = $self->imap->idle or warn "Couldn't idle: $@\n";
-    $self->reg_ae(io => $self->imap->Socket, 0 , sub {
+    $connect = sub {
+        $self->{imap} = undef;
+        $socket = undef if $socket;
+        $hdl    = $self->{_ae}{handle} = undef;
+
+        $socket = IO::Socket::SSL->new(
+            PeerAddr => $server,
+            PeerPort => $port,
+        ) or die "socket(): $@";
+
+        $hdl = AnyEvent::Handle->new(
+            fh       => $socket,
+            on_error => sub {
+                warn "[DEBUG] error!\n" if $self->imap && $self->imap->Debug;
+                $connect->();
+            },
+            on_read  => $read,
+            on_eof   => sub {
+                warn "[DEBUG] EOF!\n" if $self->imap && $self->imap->Debug;
+                $connect->();
+            },
+        );
+
+        $self->imap(Mail::IMAPClient->new(%{ $self->{args} }, Socket => $hdl->fh))
+            or die "Could not connect to IMAP server";
+        $self->imap->select("inbox");
+        $self->event(on_connect => $self->imap);
+
+        $self->reg_ae(handle => $hdl);
+    };
+
+    $read = sub {
         my $imap = $self->imap;
         my $s = $self->imap->Socket;
         my $line = <$s>;
@@ -185,24 +187,22 @@ sub handle_on_connected {
             }
             $idle = $imap->idle;
         }
-        elsif ($line =~ /BYE/) {
-            warn "[DEBUG] bye\n" if $imap->Debug;
-            $self->unreg_ae;
-            $imap->logout;
-            $imap->disconnect;
-            $self->{imap} = undef;
-        }
-    });
+    };
 
-    $self->reg_ae(timer => $interval, $interval, sub {
+    $connect->();
+
+    $self->reg_ae(timer => $noop_interval, $noop_interval, sub {
         my $imap = $self->imap;
-        warn "[DEBUG] noop ".AE::now()."\n" if $imap->Debug;
+        warn "[DEBUG] keep connection ".AE::now()."\n" if $imap->Debug;
         $imap->done($idle);
         %cached_msgs = map { $_ => 1 } @{ $imap->unseen };
         $idle = $imap->idle;
         AE::now_update;
     });
+
+    $self;
 }
+
 
 1;
 __END__
