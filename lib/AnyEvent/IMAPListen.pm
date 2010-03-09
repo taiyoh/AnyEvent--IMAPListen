@@ -8,7 +8,7 @@ use AnyEvent::Handle;
 use IO::Socket::SSL;
 use Mail::IMAPClient;
 
-our $VERSION = '0.03';
+our $VERSION = '0.031';
 our $INTERVAL = 300;
 
 =head1 NAME
@@ -166,6 +166,7 @@ sub start() {
         $self->event(on_connect => $self->imap);
 
         $self->reg_ae(handle => $hdl);
+        $idle = $self->imap->idle;
     };
 
     $read = sub {
