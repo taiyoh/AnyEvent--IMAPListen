@@ -8,7 +8,7 @@ use AnyEvent::Handle;
 use IO::Socket::SSL;
 use Mail::IMAPClient;
 
-our $VERSION = '0.031';
+our $VERSION = '0.040';
 our $INTERVAL = 300;
 
 =head1 NAME
@@ -67,7 +67,7 @@ sub new {
         $self->event(on_notify => $header, $msgid);
     };
 
-    my $instance = bless { imap => undef, args => \%args, _ae => {} }, $pkg;
+    my $instance = bless { imap => undef, args => \%args }, $pkg;
 
     $instance->reg_cb(on_connect => $on_connect);
     $instance->reg_cb(on_error   => $on_error);
@@ -91,33 +91,99 @@ sub debug (;$) {
     $_[0]->imap->Debug;
 }
 
-sub ae (;$) {
-    if (@_ > 1) {
-        return $_[0]->{_ae}{$_[1]};
+do {
+    my %idle;
+    my %cache;
+    my %ae;
+
+    sub idle_start {
+        my $self = shift;
+        $idle{$self+0} = $self->imap->idle
     }
-    $_[0]->{_ae};
+
+    sub idle_stop {
+        my ($self) = @_;
+        $self->imap->done($idle{$self+0});
+        $idle{$self+0} = undef;
+    }
+
+    sub _update_cache {
+        my $self = shift;
+        $cache{$self+0} = +{ map { $_ => 1 } @_ };
+    }
+
+    sub _add_cache {
+        my $self = shift;
+        $cache{$self+0}{$_[0]} = 1;
+    }
+
+    sub _has_cache {
+        my $self = shift;
+        !!$cache{$self+0}{$_[0]};
+    }
+
+    sub ae (;$) {
+        my ($self, $key) = @_;
+        if ($key) {
+            return $ae{$self+0}{$key};
+        }
+        $ae{$self+0};
+    }
+
+    sub reg_ae ($$;$@) {
+        my $self = shift;
+        my ($name, @args) = @_;
+        if (ref($args[0]) =~ /^(AnyEvent|AE)/) {
+            $ae{$self+0}{$name} = $args[0];
+        }
+        else {
+            my $f = "AE::${name}";
+            $ae{$self+0}{$name} = &$f(@args);
+        }
+        return $ae{$self+0}{$name};
+    }
+
+    sub unreg_ae ($;@) {
+        my $self = shift;
+        if (@_) {
+            delete $ae{$self+0}{$_} for @_;
+        }
+        else {
+            $ae{$self+0} = undef;
+        }
+        return undef;
+    }
+
+    sub DESTROY {
+        my $self = shift;
+        $idle{$self+0}  = undef;
+        $cache{$self+0} = undef;
+        $ae{$self+0}    = undef;
+    }
+};
+
+sub on_read_proc {
+    my ($self, $line) = @_;
+    my $imap = $self->imap;
+    warn "[DEBUG] notify!\n" if $imap->Debug;
+    eval {
+        for my $msgid (grep { !$self->_has_cache($_) } @{ $imap->unseen }) {
+            $self->_add_cache($msgid);
+            warn "[DEBUG] id: ${msgid}\n" if $imap->Debug;
+            $self->event(handle_notify => $msgid);
+        }
+    };
+    if ($@) {
+        $self->event(on_error => $@, $imap->LastError, $imap);
+    }
 }
 
-sub reg_ae ($$;$@) {
+sub interval_proc {
     my $self = shift;
-    my ($name, @args) = @_;
-    if (ref($args[0]) =~ /^(AnyEvent|AE)/) {
-        $self->{_ae}{$name} = $args[0];
-    }
-    else {
-        my $f = "AE::${name}";
-        $self->{_ae}{$name} = &$f(@args);
-    }
-}
-
-sub unreg_ae ($;@) {
-    my $self = shift;
-    if (@_) {
-        delete $self->{_ae}{$_} for @_;
-    }
-    else {
-        $self->{_ae} = undef;
-    }
+    my $imap = $self->imap;
+    warn "[DEBUG] keep connection <$self->{args}{User}> ".AE::now()."\n" if $imap->Debug;
+    $self->_update_cache(@{ $imap->unseen });
+    AE::now_update;
 }
 
 sub start() {
@@ -134,13 +200,10 @@ sub start() {
     my $server = delete $self->{args}{Server};
     my $port   = delete $self->{args}{Port};
 
-    my ($hdl, $socket, $connect, $read);
-    my ($idle, %cached_msgs);
+    my ($hdl, $socket, $connect);
 
     $connect = sub {
-        $self->{imap} = undef;
-        $socket = undef if $socket;
-        $hdl    = $self->{_ae}{handle} = undef;
+        $self->{imap} = $socket = $hdl = $self->unreg_ae('handle');
 
         $socket = IO::Socket::SSL->new(
             PeerAddr => $server,
@@ -149,11 +212,18 @@ sub start() {
 
         $hdl = AnyEvent::Handle->new(
             fh       => $socket,
+            on_read  => sub {
+                my $s = shift->fh;
+                my $line = <$s>;
+                return if $line !~ /EXISTS/;
+                $self->idle_stop;
+                $self->on_read_proc($line);
+                $self->idle_start;
+            },
             on_error => sub {
                 warn "[DEBUG] error!\n" if $self->imap && $self->imap->Debug;
                 $connect->();
             },
-            on_read  => $read,
             on_eof   => sub {
                 warn "[DEBUG] EOF!\n" if $self->imap && $self->imap->Debug;
                 $connect->();
@@ -166,39 +236,15 @@ sub start() {
         $self->event(on_connect => $self->imap);
 
         $self->reg_ae(handle => $hdl);
-        $idle = $self->imap->idle;
-    };
-
-    $read = sub {
-        my $imap = $self->imap;
-        my $s = $self->imap->Socket;
-        my $line = <$s>;
-        if ($line =~ /EXISTS/) {
-            $imap->done($idle);
-            warn "[DEBUG] notify!\n" if $imap->Debug;
-            eval {
-                for my $msgid (grep { !$cached_msgs{$_} } @{ $imap->unseen }) {
-                    $cached_msgs{$msgid} = 1;
-                    warn "[DEBUG] id: ${msgid}\n" if $imap->Debug;
-                    $self->event(handle_notify => $msgid);
-                }
-            };
-            if ($@) {
-                $self->event(on_error => $@, $imap->LastError, $imap);
-            }
-            $idle = $imap->idle;
-        }
+        $self->idle_start;
     };
 
     $connect->();
 
     $self->reg_ae(timer => $noop_interval, $noop_interval, sub {
-        my $imap = $self->imap;
-        warn "[DEBUG] keep connection ".AE::now()."\n" if $imap->Debug;
-        $imap->done($idle);
-        %cached_msgs = map { $_ => 1 } @{ $imap->unseen };
-        $idle = $imap->idle;
-        AE::now_update;
+        $self->idle_stop;
+        $self->interval_proc;
+        $self->idle_start;
     });
 
     $self;
