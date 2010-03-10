@@ -8,7 +8,7 @@ use AnyEvent::Handle;
 use IO::Socket::SSL;
 use Mail::IMAPClient;
 
-our $VERSION = '0.040';
+our $VERSION = '0.041';
 our $INTERVAL = 300;
 
 =head1 NAME
@@ -203,22 +203,27 @@ sub start() {
     my ($hdl, $socket, $connect);
 
     $connect = sub {
-        $self->{imap} = $socket = $hdl = $self->unreg_ae('handle');
+        $self->{imap} = $socket = $hdl = $self->unreg_ae('handle'); # undef
 
         $socket = IO::Socket::SSL->new(
             PeerAddr => $server,
             PeerPort => $port,
         ) or die "socket(): $@";
 
+        $self->imap(Mail::IMAPClient->new(%{ $self->{args} }, Socket => $socket))
+            or die "Could not connect to IMAP server";
+
         $hdl = AnyEvent::Handle->new(
             fh       => $socket,
             on_read  => sub {
-                my $s = shift->fh;
-                my $line = <$s>;
-                return if $line !~ /EXISTS/;
-                $self->idle_stop;
-                $self->on_read_proc($line);
-                $self->idle_start;
+                shift->push_read(line => sub {
+                    my $line = $_[1];
+                    warn "[DEBUG] on_read <@_>\n" if $self->debug;
+                    return if $line !~ /EXISTS/;
+                    $self->idle_stop;
+                    $self->on_read_proc($line);
+                    $self->idle_start;
+                });
             },
             on_error => sub {
                 warn "[DEBUG] error!\n" if $self->imap && $self->imap->Debug;
@@ -230,8 +235,6 @@ sub start() {
             },
         );
 
-        $self->imap(Mail::IMAPClient->new(%{ $self->{args} }, Socket => $hdl->fh))
-            or die "Could not connect to IMAP server";
         $self->imap->select("inbox");
         $self->event(on_connect => $self->imap);
 
