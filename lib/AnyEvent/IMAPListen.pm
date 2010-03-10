@@ -8,7 +8,7 @@ use AnyEvent::Handle;
 use IO::Socket::SSL;
 use Mail::IMAPClient;
 
-our $VERSION = '0.041';
+our $VERSION = '0.045';
 our $INTERVAL = 300;
 
 =head1 NAME
@@ -33,7 +33,7 @@ AnyEvent::IMAPListen
           my ($self, $header, $msg_id) = @_;
       },
       on_error => sub {
-          my ($self, $e_error, $l_error) = @_;
+          my ($self, $eval_error, $imap_error) = @_;
       }
   )->start;
 
@@ -45,33 +45,23 @@ sub new {
     my $pkg = shift;
     my %args = ($_[1]) ? @_ : %{$_[1]};
 
-    $args{Server} or die "no server name\n";
-    $args{Port}   or die "no port number\n";
+    $args{Server}   or die "no server name\n";
+    $args{Port}     or die "no port number\n";
+    $args{User}     or die "no username\n";
+    $args{Password} or die "no password\n";
 
-    my $on_connect = delete $args{on_connect} || sub {
-        my $self = shift;
-        warn "[DEBUG] connected\n" if $self->debug;
-    };
-    my $on_error = delete $args{on_error} || sub {
-        my $self = shift;
-        warn "[DEBUG] error\n" if $self->debug;
-    };
-    my $on_notify = delete $args{on_notify} || sub {
-        my $self = shift;
-        warn "[DEBUG] notify\n" if $self->debug;
-    };
-    my $handle_notify  = delete $args{handle_notify}  || sub {
-        my $self  = shift;
-        my $msgid = shift or return;
-        my $header = $self->imap->parse_headers($msgid, 'ALL');
-        $self->event(on_notify => $header, $msgid);
-    };
+    my $on_connect    = delete $args{on_connect}    || \&AnyEvent::IMAPListen::Internal::on_connect;
+    my $on_error      = delete $args{on_error}      || \&AnyEvent::IMAPListen::Internal::on_error;
+    my $on_notify     = delete $args{on_notify}     || \&AnyEvent::IMAPListen::Internal::on_notify;
+    my $on_interval   = delete $args{on_interval}   || \&AnyEvent::IMAPListen::Internal::on_interval;
+    my $handle_notify = delete $args{handle_notify} || \&AnyEvent::IMAPListen::Internal::handle_notify;
 
     my $instance = bless { imap => undef, args => \%args }, $pkg;
 
-    $instance->reg_cb(on_connect => $on_connect);
-    $instance->reg_cb(on_error   => $on_error);
-    $instance->reg_cb(on_notify  => $on_notify);
+    $instance->reg_cb(on_connect    => $on_connect);
+    $instance->reg_cb(on_error      => $on_error);
+    $instance->reg_cb(on_notify     => $on_notify);
+    $instance->reg_cb(on_interval   => $on_interval);
     $instance->reg_cb(handle_notify => $handle_notify);
 
     $instance;
@@ -85,6 +75,7 @@ sub imap (;$) {
 }
 
 sub debug (;$) {
+    return unless $_[0]->imap;
     if (@_ > 1) {
         $_[0]->imap->Debug($_[1]);
     }
@@ -162,30 +153,6 @@ do {
     }
 };
 
-sub on_read_proc {
-    my ($self, $line) = @_;
-    my $imap = $self->imap;
-    warn "[DEBUG] notify!\n" if $imap->Debug;
-    eval {
-        for my $msgid (grep { !$self->_has_cache($_) } @{ $imap->unseen }) {
-            $self->_add_cache($msgid);
-            warn "[DEBUG] id: ${msgid}\n" if $imap->Debug;
-            $self->event(handle_notify => $msgid);
-        }
-    };
-    if ($@) {
-        $self->event(on_error => $@, $imap->LastError, $imap);
-    }
-}
-
-sub interval_proc {
-    my $self = shift;
-    my $imap = $self->imap;
-    warn "[DEBUG] keep connection <$self->{args}{User}> ".AE::now()."\n" if $imap->Debug;
-    $self->_update_cache(@{ $imap->unseen });
-    AE::now_update;
-}
-
 sub start() {
     my $self = shift;
 
@@ -203,7 +170,7 @@ sub start() {
     my ($hdl, $socket, $connect);
 
     $connect = sub {
-        $self->{imap} = $socket = $hdl = $self->unreg_ae('handle'); # undef
+        $self->{imap} = $socket = $hdl = $self->unreg_ae('handle'); # = undef
 
         $socket = IO::Socket::SSL->new(
             PeerAddr => $server,
@@ -213,30 +180,28 @@ sub start() {
         $self->imap(Mail::IMAPClient->new(%{ $self->{args} }, Socket => $socket))
             or die "Could not connect to IMAP server";
 
+        $self->imap->select("inbox");
+        $self->event(on_connect => $self->imap);
+
         $hdl = AnyEvent::Handle->new(
             fh       => $socket,
             on_read  => sub {
                 shift->push_read(line => sub {
-                    my $line = $_[1];
-                    warn "[DEBUG] on_read <@_>\n" if $self->debug;
-                    return if $line !~ /EXISTS/;
+                    return if $_[1] !~ /EXISTS/;
                     $self->idle_stop;
-                    $self->on_read_proc($line);
+                    $self->event(handle_notify => $_[1]);
                     $self->idle_start;
                 });
             },
             on_error => sub {
-                warn "[DEBUG] error!\n" if $self->imap && $self->imap->Debug;
+                warn "[DEBUG] error!\n" if $self->debug;
                 $connect->();
             },
             on_eof   => sub {
-                warn "[DEBUG] EOF!\n" if $self->imap && $self->imap->Debug;
+                warn "[DEBUG] EOF!\n" if $self->debug;
                 $connect->();
             },
         );
-
-        $self->imap->select("inbox");
-        $self->event(on_connect => $self->imap);
 
         $self->reg_ae(handle => $hdl);
         $self->idle_start;
@@ -246,13 +211,53 @@ sub start() {
 
     $self->reg_ae(timer => $noop_interval, $noop_interval, sub {
         $self->idle_stop;
-        $self->interval_proc;
+        $self->event('on_interval');
         $self->idle_start;
     });
 
     $self;
 }
 
+package AnyEvent::IMAPListen::Internal;
+
+sub on_connect {
+    my $self = shift;
+    warn "[DEBUG] connected\n" if $self->debug;
+}
+
+sub on_error {
+    my $self = shift;
+    warn "[DEBUG] error\n" if $self->debug;
+}
+
+sub on_notify {
+    # modify me!
+}
+
+sub handle_notify {
+    my ($self, $line) = @_;
+    chomp $line;
+    my $imap = $self->imap;
+    warn "[DEBUG] notify! <$line>\n" if $self->debug;
+    eval {
+        for my $msgid (grep { !$self->_has_cache($_) } @{ $imap->unseen }) {
+            $self->_add_cache($msgid);
+            warn "[DEBUG] id: ${msgid}\n" if $self->debug;
+            my $header = $self->imap->parse_headers($msgid, 'ALL');
+            $self->event(on_notify => $header, $msgid);
+        }
+    };
+    if ($@) {
+        $self->event(on_error => $@, $imap->LastError, $imap);
+    }
+}
+
+sub on_interval {
+    my $self = shift;
+    AE::now_update;
+    warn "[DEBUG] keep connection <$self->{args}{User}> ".AE::now()."\n" if $self->debug;
+    $self->_update_cache(@{ $self->imap->unseen });
+}
 
 1;
 __END__
